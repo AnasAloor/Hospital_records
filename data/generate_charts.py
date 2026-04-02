@@ -64,33 +64,43 @@ def save(fig, name):
 # ═══════════════════════════════════════════════════════════════════════════════
 def chart_kpi_summary():
     with engine.connect() as conn:
-        # Overall KPIs
-        patients  = conn.execute(text("SELECT COUNT(DISTINCT patient_id) FROM demographics")).scalar()
-        admits    = conn.execute(text("SELECT SUM(inpatient_admits) FROM admit_info")).scalar()
-        mm        = conn.execute(text("SELECT COUNT(*) FROM admit_info")).scalar()
+        # Use treatment_info as base (matches Tableau's Custom SQL base table)
+        # De-duplicate admits using MAX per patient-month (matches Tableau LOD)
+        patients  = conn.execute(text("SELECT COUNT(DISTINCT patient_id) FROM treatment_info")).scalar()
+        mm        = conn.execute(text("SELECT COUNT(*) FROM treatment_info")).scalar()
+        admits    = conn.execute(text("""
+            SELECT SUM(a.inpatient_admits)
+            FROM (SELECT DISTINCT patient_id, month, MAX(inpatient_admits) AS inpatient_admits
+                  FROM admit_info GROUP BY patient_id, month) a
+        """)).scalar()
         bsi       = conn.execute(text("SELECT SUM(bsi_event) FROM admit_info")).scalar()
         facilities= conn.execute(text("SELECT COUNT(*) FROM facility_info")).scalar()
         avg_age_m = conn.execute(text("SELECT ROUND(AVG(age)::numeric,1) FROM demographics WHERE sex='M' AND age BETWEEN 0 AND 120")).scalar()
         avg_age_f = conn.execute(text("SELECT ROUND(AVG(age)::numeric,1) FROM demographics WHERE sex='F' AND age BETWEEN 0 AND 120")).scalar()
-        miss_labs = conn.execute(text("SELECT COUNT(*) FROM labs WHERE albumin IS NULL OR hemoglobin IS NULL OR hematocrit IS NULL OR ktv IS NULL")).scalar()
+        # Missing labs: count treatment_info rows where joined lab is NULL (matches Tableau 326)
+        miss_labs = conn.execute(text("""
+            SELECT COUNT(*) FROM treatment_info ti
+            LEFT JOIN labs l ON ti.patient_id=l.patient_id AND ti.month=l.month
+            WHERE l.albumin IS NULL AND l.hemoglobin IS NULL AND l.hematocrit IS NULL AND l.ktv IS NULL
+        """)).scalar()
         comp_100  = conn.execute(text("SELECT COUNT(*) FROM treatment_info WHERE total_scheduled_tx>0 AND total_tx>=total_scheduled_tx")).scalar()
         comp_low  = conn.execute(text("SELECT COUNT(*) FROM treatment_info WHERE total_scheduled_tx>0 AND (total_tx::float/total_scheduled_tx)<0.70")).scalar()
 
-        # Per-region clinical profile
+        # Per-region clinical profile — treatment_info base, LEFT JOINs (matches Tableau)
         q_region = """
             SELECT fi.region_id,
-                   COUNT(DISTINCT d.patient_id)                                             AS patients,
-                   ROUND((SUM(ai.inpatient_admits)*100.0/COUNT(ai.patient_id))::numeric,2)  AS hosp_rate,
-                   ROUND(AVG(d.age)::numeric,1)                                             AS avg_age,
-                   ROUND(AVG(l.ktv)::numeric,2)                                             AS avg_ktv,
-                   ROUND(AVG(l.albumin)::numeric,2)                                         AS avg_albumin,
-                   ROUND(AVG(ti.total_mtx)::numeric,2)                                      AS avg_missed,
+                   COUNT(DISTINCT ti.patient_id)                                                          AS patients,
+                   ROUND((SUM(ai.inpatient_admits)*100.0/COUNT(ti.patient_id))::numeric,2)                AS hosp_rate,
+                   ROUND(AVG(d.age)::numeric,1)                                                           AS avg_age,
+                   ROUND(AVG(l.ktv)::numeric,2)                                                           AS avg_ktv,
+                   ROUND(AVG(l.albumin)::numeric,2)                                                       AS avg_albumin,
+                   ROUND(AVG(ti.total_mtx)::numeric,2)                                                    AS avg_missed,
                    ROUND((SUM(CASE WHEN ti.access_type='CVC' THEN 1 ELSE 0 END)*100.0/COUNT(*))::numeric,1) AS cvc_pct
-            FROM admit_info ai
-            JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
-            JOIN demographics d    ON ai.patient_id=d.patient_id  AND ai.month=d.month
-            JOIN labs l            ON ai.patient_id=l.patient_id  AND ai.month=l.month
-            JOIN facility_info fi  ON ti.facility_id=fi.facility_id
+            FROM treatment_info ti
+            LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
+            LEFT JOIN demographics d ON ti.patient_id=d.patient_id AND ti.month=d.month
+            LEFT JOIN labs l         ON ti.patient_id=l.patient_id AND ti.month=l.month
+            JOIN facility_info fi    ON ti.facility_id=fi.facility_id
             GROUP BY fi.region_id ORDER BY fi.region_id
         """
         region_rows = conn.execute(text(q_region)).fetchall()
@@ -126,7 +136,7 @@ def chart_kpi_summary():
          COLOR_MID),
         ("Dialysis Facilities",
          f"{facilities}",
-         f"4 in Washington  |  5 in Alabama",
+         f"4 in Washington (Region A)  |  5 in Alabama (Region B)",
          "#7B2D8B"),
         ("Average Patient Age",
          f"{avg_age_m} / {avg_age_f}",
@@ -200,47 +210,56 @@ def chart_kpi_summary():
 # ═══════════════════════════════════════════════════════════════════════════════
 def chart_region_comparison():
     with engine.connect() as conn:
+        # Use treatment_info as base with LEFT JOIN to admit_info — matches Tableau
         q_rate = """
             SELECT fi.region_id,
-                   COUNT(ai.patient_id) AS mm,
+                   COUNT(ti.patient_id) AS mm,
                    SUM(ai.inpatient_admits) AS admits,
-                   (SUM(ai.inpatient_admits)*100.0/COUNT(ai.patient_id)) AS rate
-            FROM admit_info ai
-            JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
-            JOIN facility_info fi  ON ti.facility_id=fi.facility_id
+                   (SUM(ai.inpatient_admits)*100.0/COUNT(ti.patient_id)) AS rate
+            FROM treatment_info ti
+            LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
+            JOIN facility_info fi   ON ti.facility_id=fi.facility_id
             GROUP BY fi.region_id ORDER BY fi.region_id
         """
-        rate_df = pd.read_sql(q_rate, conn)
-        rate_df["label"] = rate_df["region_id"].map(REGION_LABELS)
+        rate_df = pd.DataFrame(conn.execute(text(q_rate)).fetchall(),
+                               columns=["region_id","mm","admits","rate"])
+        rate_df["rate"]   = rate_df["rate"].astype(float)
+        rate_df["label"]  = rate_df["region_id"].map(REGION_LABELS)
 
+        # Root cause: treatment_info base, LEFT JOIN labs — matches Tableau
         q_profile = """
             SELECT fi.region_id,
                    ROUND(AVG(l.ktv)::numeric,2)    AS avg_ktv,
-                   ROUND((SUM(CASE WHEN l.ktv<1.2 THEN 1 ELSE 0 END)*100.0/COUNT(l.ktv))::numeric,1) AS pct_inadequate_ktv,
+                   ROUND((SUM(CASE WHEN l.ktv<1.2 THEN 1 ELSE 0 END)*100.0/NULLIF(COUNT(l.ktv),0))::numeric,1) AS pct_inadequate_ktv,
                    ROUND((SUM(CASE WHEN ti.access_type='CVC' THEN 1 ELSE 0 END)*100.0/COUNT(*))::numeric,1) AS cvc_pct,
                    ROUND(AVG(ti.total_mtx)::numeric,2) AS avg_missed
             FROM treatment_info ti
-            JOIN labs l           ON ti.patient_id=l.patient_id AND ti.month=l.month
+            LEFT JOIN labs l      ON ti.patient_id=l.patient_id AND ti.month=l.month
             JOIN facility_info fi ON ti.facility_id=fi.facility_id
-            WHERE l.ktv IS NOT NULL
             GROUP BY fi.region_id ORDER BY fi.region_id
         """
-        profile_df = pd.read_sql(q_profile, conn)
+        profile_df = pd.DataFrame(conn.execute(text(q_profile)).fetchall(),
+                                  columns=["region_id","avg_ktv","pct_inadequate_ktv","cvc_pct","avg_missed"])
+        for c in ["avg_ktv","pct_inadequate_ktv","cvc_pct","avg_missed"]:
+            profile_df[c] = profile_df[c].astype(float)
         profile_df["label"] = profile_df["region_id"].map(REGION_LABELS)
 
+        # Facility ranking: treatment_info base, LEFT JOIN admit_info — matches Tableau
         q_fac = """
             SELECT ti.facility_id, fi.state, fi.region_id,
-                   COUNT(DISTINCT ai.patient_id) AS patients,
+                   COUNT(DISTINCT ti.patient_id) AS patients,
                    SUM(ai.inpatient_admits) AS admits,
-                   (SUM(ai.inpatient_admits)*100.0/COUNT(ai.patient_id)) AS rate
-            FROM admit_info ai
-            JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
-            JOIN facility_info fi  ON ti.facility_id=fi.facility_id
+                   (SUM(ai.inpatient_admits)*100.0/COUNT(ti.patient_id)) AS rate
+            FROM treatment_info ti
+            LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
+            JOIN facility_info fi   ON ti.facility_id=fi.facility_id
             GROUP BY ti.facility_id, fi.state, fi.region_id
             ORDER BY rate DESC
         """
-        fac_df = pd.read_sql(q_fac, conn)
-        fac_df["fac_label"] = "Facility " + fac_df["facility_id"].astype(str) + "\n(" + fac_df["state"] + ")"
+        fac_df = pd.DataFrame(conn.execute(text(q_fac)).fetchall(),
+                              columns=["facility_id","state","region_id","patients","admits","rate"])
+        fac_df["rate"]         = fac_df["rate"].astype(float)
+        fac_df["fac_label"]    = "Facility " + fac_df["facility_id"].astype(str) + "\n(" + fac_df["state"] + ")"
         fac_df["region_label"] = fac_df["region_id"].map(REGION_LABELS)
 
     fig, axes = plt.subplots(1, 3, figsize=(19, 7))
@@ -335,23 +354,23 @@ def chart_region_comparison():
 # ═══════════════════════════════════════════════════════════════════════════════
 def chart_key_drivers():
     with engine.connect() as conn:
-        # Missed Tx dose-response
+        # Missed Tx dose-response — treatment_info base, LEFT JOIN admit_info (matches Tableau)
         q1 = text("""
             SELECT CASE WHEN ti.total_mtx IS NULL OR ti.total_mtx=0 THEN '0 Missed Treatments'
                         WHEN ti.total_mtx=1 THEN '1 Missed Treatment'
                         WHEN ti.total_mtx=2 THEN '2 Missed Treatments'
                         ELSE '3 or More Missed Treatments' END AS grp,
                    COUNT(*) AS cnt,
-                   ROUND(AVG(ai.inpatient_admits)::numeric,3) AS avg_admits
-            FROM admit_info ai
-            JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
+                   ROUND(AVG(ai.inpatient_admits)::numeric,4) AS avg_admits
+            FROM treatment_info ti
+            LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
             GROUP BY grp
             ORDER BY avg_admits
         """)
         mtx_df = pd.DataFrame(conn.execute(q1).fetchall(), columns=["grp","cnt","avg_admits"])
         mtx_df["avg_admits"] = mtx_df["avg_admits"].astype(float)
 
-        # Treatment completion rate vs admits
+        # Treatment completion rate vs admits — treatment_info base, LEFT JOIN admit_info
         q2 = text("""
             SELECT CASE
                 WHEN (ti.total_tx::float/NULLIF(ti.total_scheduled_tx,0))*100 < 70
@@ -363,9 +382,9 @@ def chart_key_drivers():
                 ELSE '100% (Fully Complete)'
             END AS comp_grp,
             COUNT(*) AS cnt,
-            ROUND(AVG(ai.inpatient_admits)::numeric,3) AS avg_admits
-            FROM admit_info ai
-            JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
+            ROUND(AVG(ai.inpatient_admits)::numeric,4) AS avg_admits
+            FROM treatment_info ti
+            LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
             WHERE ti.total_scheduled_tx > 0
             GROUP BY comp_grp
             ORDER BY avg_admits DESC
@@ -373,7 +392,7 @@ def chart_key_drivers():
         comp_df = pd.DataFrame(conn.execute(q2).fetchall(), columns=["comp_grp","cnt","avg_admits"])
         comp_df["avg_admits"] = comp_df["avg_admits"].astype(float)
 
-        # Risk score staircase
+        # Risk score staircase — treatment_info base, LEFT JOINs (matches Tableau)
         q3 = text("""
             SELECT
                 (CASE WHEN ti.access_type='CVC' THEN 1 ELSE 0 END
@@ -382,10 +401,10 @@ def chart_key_drivers():
                + CASE WHEN l.ktv < 1.2 THEN 1 ELSE 0 END
                + CASE WHEN ti.frequent_excessive_fluid_gain_flag=1 THEN 1 ELSE 0 END) AS risk_score,
                 COUNT(*) AS mm,
-                ROUND(AVG(ai.inpatient_admits)::numeric,3) AS avg_admits
-            FROM admit_info ai
-            JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
-            JOIN labs l            ON ai.patient_id=l.patient_id  AND ai.month=l.month
+                ROUND(AVG(ai.inpatient_admits)::numeric,4) AS avg_admits
+            FROM treatment_info ti
+            LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
+            LEFT JOIN labs l        ON ti.patient_id=l.patient_id  AND ti.month=l.month
             WHERE l.albumin IS NOT NULL AND l.ktv IS NOT NULL
             GROUP BY risk_score ORDER BY risk_score
         """)
@@ -480,14 +499,14 @@ def chart_key_drivers():
 # ═══════════════════════════════════════════════════════════════════════════════
 def chart_next_steps():
     with engine.connect() as conn:
-        # CVC rate
+        # CVC rate — treatment_info base, LEFT JOIN admit_info (matches Tableau)
         q_cvc = """
             SELECT ti.access_type,
-                   COUNT(ai.patient_id) AS mm,
+                   COUNT(ti.patient_id) AS mm,
                    SUM(ai.inpatient_admits) AS admits,
-                   (SUM(ai.inpatient_admits)*100.0/COUNT(ai.patient_id)) AS rate
-            FROM admit_info ai
-            JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
+                   (SUM(ai.inpatient_admits)*100.0/COUNT(ti.patient_id)) AS rate
+            FROM treatment_info ti
+            LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
             GROUP BY ti.access_type
         """
         cvc_df = pd.DataFrame(conn.execute(text(q_cvc)).fetchall(), columns=["access_type","mm","admits","rate"])
@@ -496,13 +515,13 @@ def chart_next_steps():
         noncvc_rate = float(cvc_df.loc[cvc_df.access_type=="Non-CVC", "rate"].values[0])
         cvc_mm      = int(cvc_df.loc[cvc_df.access_type=="CVC",       "mm"].values[0])
 
-        # Missed Tx rate
+        # Missed Tx rate — treatment_info base, LEFT JOIN admit_info
         q_mtx = """
             SELECT CASE WHEN ti.total_mtx>0 THEN 'Has Missed Tx' ELSE 'No Missed Tx' END AS grp,
                    COUNT(*) AS mm,
-                   ROUND(AVG(ai.inpatient_admits)::numeric,3) AS avg_admits
-            FROM admit_info ai
-            JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
+                   ROUND(AVG(ai.inpatient_admits)::numeric,4) AS avg_admits
+            FROM treatment_info ti
+            LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
             GROUP BY grp
         """
         mtx_df   = pd.DataFrame(conn.execute(text(q_mtx)).fetchall(), columns=["grp","mm","avg_admits"])
@@ -511,13 +530,14 @@ def chart_next_steps():
         mtx_low  = float(mtx_df.loc[mtx_df.grp=="No Missed Tx",  "avg_admits"].values[0])
         mtx_mm   = int(mtx_df.loc[mtx_df.grp=="Has Missed Tx",   "mm"].values[0])
 
-        # KTV
+        # KTV — treatment_info base, LEFT JOIN labs and admit_info
         q_ktv = """
             SELECT CASE WHEN l.ktv<1.2 THEN 'Inadequate' ELSE 'Adequate' END AS grp,
                    COUNT(*) AS mm,
-                   ROUND(AVG(ai.inpatient_admits)::numeric,3) AS avg_admits
-            FROM admit_info ai
-            JOIN labs l ON ai.patient_id=l.patient_id AND ai.month=l.month
+                   ROUND(AVG(ai.inpatient_admits)::numeric,4) AS avg_admits
+            FROM treatment_info ti
+            LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
+            LEFT JOIN labs l        ON ti.patient_id=l.patient_id  AND ti.month=l.month
             WHERE l.ktv IS NOT NULL
             GROUP BY grp
         """
@@ -527,13 +547,14 @@ def chart_next_steps():
         ktv_low  = float(ktv_df.loc[ktv_df.grp=="Adequate",   "avg_admits"].values[0])
         ktv_mm   = int(ktv_df.loc[ktv_df.grp=="Inadequate",   "mm"].values[0])
 
-        # Albumin
+        # Albumin — treatment_info base, LEFT JOINs
         q_alb = """
             SELECT CASE WHEN l.albumin<3.5 THEN 'Low' ELSE 'Normal' END AS grp,
                    COUNT(*) AS mm,
-                   ROUND(AVG(ai.inpatient_admits)::numeric,3) AS avg_admits
-            FROM admit_info ai
-            JOIN labs l ON ai.patient_id=l.patient_id AND ai.month=l.month
+                   ROUND(AVG(ai.inpatient_admits)::numeric,4) AS avg_admits
+            FROM treatment_info ti
+            LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
+            LEFT JOIN labs l        ON ti.patient_id=l.patient_id  AND ti.month=l.month
             WHERE l.albumin IS NOT NULL
             GROUP BY grp
         """
@@ -543,14 +564,13 @@ def chart_next_steps():
         alb_low  = float(alb_df.loc[alb_df.grp=="Normal", "avg_admits"].values[0])
         alb_mm   = int(alb_df.loc[alb_df.grp=="Low",      "mm"].values[0])
 
-        # BSI by access type
+        # BSI by access type — treatment_info base, LEFT JOIN admit_info
         q_bsi = """
             SELECT ti.access_type,
                    SUM(ai.bsi_event) AS bsi_events,
-                   COUNT(*) AS mm
-            FROM admit_info ai
-            JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
-            WHERE ai.bsi_event IS NOT NULL
+                   COUNT(ti.patient_id) AS mm
+            FROM treatment_info ti
+            LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
             GROUP BY ti.access_type
         """
         bsi_df = pd.DataFrame(conn.execute(text(q_bsi)).fetchall(), columns=["access_type","bsi_events","mm"])
@@ -648,11 +668,11 @@ def chart_next_steps():
 # ═══════════════════════════════════════════════════════════════════════════════
 def chart_monthly_trend():
     q = """
-        SELECT ai.month, fi.region_id, SUM(ai.inpatient_admits) AS total_admits
-        FROM admit_info ai
-        JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
-        JOIN facility_info  fi ON ti.facility_id=fi.facility_id
-        GROUP BY ai.month, fi.region_id ORDER BY ai.month
+        SELECT ti.month, fi.region_id, SUM(ai.inpatient_admits) AS total_admits
+        FROM treatment_info ti
+        LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
+        JOIN facility_info  fi  ON ti.facility_id=fi.facility_id
+        GROUP BY ti.month, fi.region_id ORDER BY ti.month
     """
     df = pd.read_sql(q, engine)
     df["month"] = pd.to_datetime(df["month"])
@@ -688,10 +708,10 @@ def chart_admits_by_facility():
     q = """
         SELECT ti.facility_id, fi.state, fi.region_id,
                SUM(ai.inpatient_admits) AS total_admits
-        FROM admit_info ai
-        JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
-        JOIN facility_info  fi ON ti.facility_id=fi.facility_id
-        WHERE ai.month = '2017-12-31'
+        FROM treatment_info ti
+        LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
+        JOIN facility_info  fi  ON ti.facility_id=fi.facility_id
+        WHERE ti.month = '2017-12-31'
         GROUP BY ti.facility_id, fi.state, fi.region_id
         ORDER BY fi.region_id, ti.facility_id
     """
@@ -758,11 +778,11 @@ def chart_demographics():
 def chart_cvc_comparison():
     q = """
         SELECT ti.access_type,
-               COUNT(ai.patient_id) AS mm,
+               COUNT(ti.patient_id) AS mm,
                SUM(ai.inpatient_admits) AS admits,
-               (SUM(ai.inpatient_admits)*100.0/COUNT(ai.patient_id)) AS rate
-        FROM admit_info ai
-        JOIN treatment_info ti ON ai.patient_id=ti.patient_id AND ai.month=ti.month
+               (SUM(ai.inpatient_admits)*100.0/COUNT(ti.patient_id)) AS rate
+        FROM treatment_info ti
+        LEFT JOIN admit_info ai ON ti.patient_id=ai.patient_id AND ti.month=ai.month
         GROUP BY ti.access_type ORDER BY ti.access_type
     """
     df = pd.read_sql(q, engine)
